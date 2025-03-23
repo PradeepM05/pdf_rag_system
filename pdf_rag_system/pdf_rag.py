@@ -2,6 +2,7 @@ import os
 import sys
 import hashlib
 import json
+import time
 from typing import List, Dict, Set, Optional
 import argparse
 from dotenv import load_dotenv
@@ -12,19 +13,27 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
 
-# Try to import OpenAI for completions
-try:
-    from langchain_openai import OpenAI
-    from langchain.chains import create_stuff_documents_chain
-    from langchain_core.prompts import PromptTemplate
-    from langchain.chains import create_retrieval_chain
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("OpenAI package not available. Using fallback for completions.")
-
 # Load environment variables from .env file if it exists
 load_dotenv()
+
+# Print debugging information about the OpenAI API key
+api_key = os.environ.get("OPENAI_API_KEY", "")
+if api_key:
+    print(f"OpenAI API key found: {api_key[:5]}...{api_key[-4:]}")
+else:
+    print("WARNING: No OpenAI API key found in environment variables")
+
+# Try to import OpenAI for completions with more compatible imports
+try:
+    from langchain_openai import ChatOpenAI  # Use ChatOpenAI instead of OpenAI
+    from langchain.chains import RetrievalQA  # Use RetrievalQA as a fallback
+    from langchain_core.prompts import PromptTemplate
+    OPENAI_AVAILABLE = True
+    print("Successfully imported OpenAI and related packages")
+except ImportError as e:
+    OPENAI_AVAILABLE = False
+    print(f"OpenAI package not available: {e}")
+    print("Using fallback for completions.")
 
 class PDFProcessor:
     def __init__(self, pdf_dir: str, processed_pdfs_file: str = "processed_pdfs.json"):
@@ -116,7 +125,14 @@ class PDFProcessor:
                         all_texts.append(
                             Document(
                                 page_content=text,
-                                metadata={"source": pdf_file, "page": i}
+                                metadata={
+                                    "source": pdf_file, 
+                                    "page": i,
+                                    # Add version metadata
+                                    "version_id": file_hash,
+                                    "timestamp": time.time(),
+                                    "status": "current"
+                                }
                             )
                         )
             except Exception as e:
@@ -156,16 +172,24 @@ class RAGSystem:
         
         # Initialize the LLM if OpenAI is available
         if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
-            self.llm = OpenAI(temperature=0)
-            # Replace deprecated QA chain with modern approach
-            prompt_template = """Answer the question based only on the following context:
+            try:
+                # Use ChatOpenAI instead of deprecated OpenAI
+                self.llm = ChatOpenAI(temperature=0)
+                # Create a simple prompt template
+                prompt_template = """Answer the question based only on the following context:
 {context}
 
 Question: {question}
 
 Answer:"""
-            prompt = PromptTemplate.from_template(prompt_template)
-            self.qa_chain = create_stuff_documents_chain(self.llm, prompt)
+                # We'll use RetrievalQA as it's more compatible across versions
+                self.qa_chain = None  # We'll create this during querying
+                print("Successfully initialized OpenAI LLM")
+            except Exception as e:
+                print(f"Error initializing OpenAI: {e}")
+                self.llm = None
+                self.qa_chain = None
+                print("Falling back to basic document retrieval")
         else:
             self.llm = None
             self.qa_chain = None
@@ -203,6 +227,35 @@ Answer:"""
         
         # Load new PDFs if any
         documents = self.pdf_processor.load_pdfs(force_reload=force_reload)
+        
+        # If we have new PDFs to process and vector store exists
+        if documents and vector_store_exists:
+            for pdf_file in unprocessed_pdfs:
+                print(f"Marking old chunks as deprecated for: {pdf_file}")
+                # Get the new file hash
+                new_hash = self.pdf_processor.processed_pdfs.get(pdf_file)
+                
+                # First mark old chunks as deprecated (instead of deleting)
+                old_docs = self.vector_store.get(
+                    where={"source": pdf_file, "status": "current"}
+                )
+                
+                if old_docs and hasattr(self.vector_store, '_collection'):
+                    # Get IDs of old documents to update
+                    old_ids = [doc.id for doc in old_docs]
+                    
+                    # Update their status to "deprecated"
+                    self.vector_store._collection.update(
+                        ids=old_ids,
+                        metadatas=[
+                            {"source": pdf_file, "page": doc.metadata["page"], 
+                             "version_id": doc.metadata["version_id"],
+                             "timestamp": doc.metadata["timestamp"], 
+                             "status": "deprecated"}
+                            for doc in old_docs
+                        ]
+                    )
+                    print(f"Marked {len(old_ids)} chunks as deprecated")
         
         # If no documents loaded or found, but we have an existing vector store, still return success
         if not documents and vector_store_exists:
@@ -248,39 +301,88 @@ Answer:"""
         if not self.vector_store:
             return "Error: Vector store not initialized. Please run initialize() first."
         
-        # Retrieve relevant documents
-        docs = self.vector_store.similarity_search(question, k=k)
+        # Retrieve relevant documents - only get current status documents
+        try:
+            docs = self.vector_store.similarity_search(
+                question, 
+                k=k,
+                filter={"status": "current"}  # Only get current documents
+            )
+            
+            if not docs:
+                return "No relevant information found."
+            
+            # If we have an LLM, try to use it
+            if self.llm and OPENAI_AVAILABLE:
+                try:
+                    # Create a retriever
+                    retriever = self.vector_store.as_retriever(
+                        search_kwargs={"k": k, "filter": {"status": "current"}}
+                    )
+                    
+                    # Create a RetrievalQA chain
+                    qa = RetrievalQA.from_chain_type(
+                        llm=self.llm,
+                        chain_type="stuff",
+                        retriever=retriever,
+                        return_source_documents=False
+                    )
+                    
+                    # Execute the chain
+                    result = qa.invoke({"query": question})
+                    
+                    # Check if result is a string or a dict (different versions return different types)
+                    if isinstance(result, dict) and "result" in result:
+                        return result["result"]
+                    elif isinstance(result, str):
+                        return result
+                    else:
+                        return str(result)
+                    
+                except Exception as e:
+                    print(f"Error using QA chain: {e}")
+                    print("Falling back to basic retrieval...")
+                    return self._fallback_answer(docs, question)
+            
+            # Fallback if no LLM is available
+            return self._fallback_answer(docs, question)
         
+        except Exception as e:
+            print(f"Error during retrieval: {e}")
+            return f"An error occurred: {str(e)}"
+    
+    def _fallback_answer(self, docs: List[Document], question: str) -> str:
+        """Fallback method to return relevant excerpts when LLM is not available"""
         if not docs:
             return "No relevant information found."
         
-        # If we have the QA chain, use it
-        if self.qa_chain:
-            # Use the modern approach for querying
-            retriever = self.vector_store.as_retriever(search_kwargs={"k": k})
-            retrieval_chain = create_retrieval_chain(retriever, self.qa_chain)
-            response = retrieval_chain.invoke({"question": question})
-            return response["answer"]
+        result = "Here are some relevant excerpts from the documents:\n\n"
+        for i, doc in enumerate(docs, 1):
+            result += f"Excerpt {i} (from {doc.metadata['source']}, page {doc.metadata['page']}):\n"
+            result += f"{doc.page_content}\n\n"
         
-        # Fallback if no LLM is available
-        return self._fallback_answer(docs, question)
-    
-    def _fallback_answer(self, docs: List[Document], question: str) -> str:
-        """Fallback method when no LLM is available"""
-        result = "Here are the most relevant excerpts from the documents:\n\n"
-        
-        for i, doc in enumerate(docs):
-            result += f"Document {i+1} (Source: {doc.metadata['source']}, Page: {doc.metadata['page']}):\n"
-            result += f"{doc.page_content[:500]}...\n\n"
-        
-        result += "\nNote: This is a fallback response as no LLM is configured. Set up OpenAI API key for better answers."
         return result
 
 def main():
     parser = argparse.ArgumentParser(description="Simple PDF RAG System")
     parser.add_argument("--pdf_dir", default="data", help="Directory containing PDF files")
     parser.add_argument("--force_reload", action="store_true", help="Force reload of all PDFs, ignoring the processed list")
+    parser.add_argument("--test_openai", action="store_true", help="Test OpenAI connectivity")
     args = parser.parse_args()
+    
+    # Test OpenAI connectivity if requested
+    if args.test_openai:
+        if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
+            try:
+                from langchain_openai import ChatOpenAI
+                test_llm = ChatOpenAI(temperature=0)
+                response = test_llm.invoke("This is a test message. Reply with 'OpenAI connection successful.'")
+                print(f"OpenAI Test Result: {response.content}")
+                print("OpenAI connectivity test completed successfully.")
+            except Exception as e:
+                print(f"OpenAI test failed: {e}")
+        else:
+            print("OpenAI packages not available or API key not set. Cannot test.")
     
     rag_system = RAGSystem(args.pdf_dir)
     
@@ -303,4 +405,4 @@ def main():
         print(answer)
 
 if __name__ == "__main__":
-    main() 
+    main()
