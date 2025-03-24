@@ -2,29 +2,29 @@ import os
 import hashlib
 import json
 import time
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Optional
 
 from pypdf import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from src.config import config  # Import the centralized configuration
+from llama_index.core import Document
+from llama_index.core.node_parser import SentenceSplitter
 
+from src.config import config
 
 class PDFProcessor:
     def __init__(self, pdf_dir: str = None, processed_pdfs_file: str = None):
+        # Use config values with fallback to parameters
         self.pdf_dir = pdf_dir or config.DATA_DIR
         self.processed_pdfs_file = processed_pdfs_file or config.PROCESSED_PDFS_FILE
         self.documents = []
-                
+        
         # Create storage directory if it doesn't exist
         os.makedirs(os.path.dirname(self.processed_pdfs_file), exist_ok=True)
         
         self.processed_pdfs = self._load_processed_pdfs()
-                
-        self.text_splitter = RecursiveCharacterTextSplitter(
+        
+        self.text_splitter = SentenceSplitter(
             chunk_size=config.CHUNK_SIZE,
-            chunk_overlap=config.CHUNK_OVERLAP,
-            length_function=len,
+            chunk_overlap=config.CHUNK_OVERLAP
         )
     
     def _compute_file_hash(self, file_path: str) -> str:
@@ -84,7 +84,7 @@ class PDFProcessor:
             print(f"No new or modified PDF files to process in {self.pdf_dir}")
             return []
         
-        all_texts = []
+        all_documents = []
         newly_processed = {}
         
         for pdf_file in pdf_files:
@@ -101,19 +101,18 @@ class PDFProcessor:
                 for i, page in enumerate(reader.pages):
                     text = page.extract_text()
                     if text.strip():  # Only add non-empty text
-                        all_texts.append(
-                            Document(
-                                page_content=text,
-                                metadata={
-                                    "source": pdf_file, 
-                                    "page": i,
-                                    # Add version metadata
-                                    "version_id": file_hash,
-                                    "timestamp": time.time(),
-                                    "status": "current"
-                                }
-                            )
+                        # Create LlamaIndex Document
+                        doc = Document(
+                            text=text,
+                            metadata={
+                                "source": pdf_file, 
+                                "page": i,
+                                "version_id": file_hash,
+                                "timestamp": time.time(),
+                                "status": "current"
+                            }
                         )
+                        all_documents.append(doc)
             except Exception as e:
                 print(f"Error processing {pdf_file}: {e}")
         
@@ -121,13 +120,13 @@ class PDFProcessor:
         self.processed_pdfs.update(newly_processed)
         self._save_processed_pdfs()
         
-        if all_texts:
-            print(f"Extracted {len(all_texts)} pages from {len(pdf_files)} PDF files")
+        if all_documents:
+            print(f"Extracted {len(all_documents)} pages from {len(pdf_files)} PDF files")
         
-        self.documents.extend(all_texts)
-        return all_texts
+        self.documents.extend(all_documents)
+        return all_documents
     
-    def split_documents(self, documents: List[Document] = None) -> List[Document]:
+    def split_documents(self, documents: Optional[List[Document]] = None) -> List[Document]:
         """Split documents into chunks"""
         if documents is None:
             documents = self.documents
@@ -136,6 +135,17 @@ class PDFProcessor:
             print("No documents to split.")
             return []
         
-        chunks = self.text_splitter.split_documents(documents)
-        print(f"Split into {len(chunks)} chunks")
-        return chunks
+        # Use the correct method depending on your LlamaIndex version
+        try:
+            # Method for newer versions
+            nodes = self.text_splitter.get_nodes_from_documents(documents)
+        except AttributeError:
+            try:
+                # Method for older versions
+                nodes = self.text_splitter.split_documents(documents)
+            except Exception as e:
+                print(f"Error splitting documents: {e}")
+                return documents  # Return original documents if splitting fails
+        
+        print(f"Split into {len(nodes)} chunks")
+        return nodes
