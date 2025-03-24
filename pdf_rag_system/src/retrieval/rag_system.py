@@ -9,6 +9,8 @@ from langchain.chains import RetrievalQA
 
 from src.processor.pdf_processor import PDFProcessor
 from src.llm.openai_integration import OPENAI_AVAILABLE
+from src.config import config  # Import the centralized configuration
+
 
 class RAGSystem:
     def __init__(self, pdf_dir: str, persist_directory: str = "storage/chroma_db"):
@@ -26,7 +28,7 @@ class RAGSystem:
         if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
             try:
                 # Use ChatOpenAI instead of deprecated OpenAI
-                self.llm = ChatOpenAI(temperature=0)
+                self.llm = ChatOpenAI(temperature=config.LLM_TEMPERATURE)
                 print("Successfully initialized OpenAI LLM")
             except Exception as e:
                 print(f"Error initializing OpenAI: {e}")
@@ -150,8 +152,10 @@ class RAGSystem:
         
         return True
     
-    def query(self, question: str, k: int = 4) -> str:
+    def query(self, question: str, k: int = None) -> str:
         """Query the RAG system with a question"""
+        # Use the config value if k is not provided
+        k = k or config.DEFAULT_RETRIEVAL_K
         if not self.vector_store:
             return "Error: Vector store not initialized. Please run initialize() first."
         
@@ -162,7 +166,7 @@ class RAGSystem:
             
             docs = self.vector_store.similarity_search(
                 question, 
-                k=k,
+                k=k or config.DEFAULT_RETRIEVAL_K,
                 filter=where_filter
             )
             

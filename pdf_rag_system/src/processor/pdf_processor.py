@@ -7,21 +7,23 @@ from typing import List, Dict, Set, Optional
 from pypdf import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
+from src.config import config  # Import the centralized configuration
+
 
 class PDFProcessor:
-    def __init__(self, pdf_dir: str, processed_pdfs_file: str = "storage/processed_pdfs.json"):
-        self.pdf_dir = pdf_dir
+    def __init__(self, pdf_dir: str = None, processed_pdfs_file: str = None):
+        self.pdf_dir = pdf_dir or config.DATA_DIR
+        self.processed_pdfs_file = processed_pdfs_file or config.PROCESSED_PDFS_FILE
         self.documents = []
-        self.processed_pdfs_file = processed_pdfs_file
-        
+                
         # Create storage directory if it doesn't exist
-        os.makedirs(os.path.dirname(processed_pdfs_file), exist_ok=True)
+        os.makedirs(os.path.dirname(self.processed_pdfs_file), exist_ok=True)
         
         self.processed_pdfs = self._load_processed_pdfs()
-        
+                
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
             length_function=len,
         )
     
