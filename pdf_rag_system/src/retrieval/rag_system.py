@@ -1,6 +1,7 @@
 import os
 from typing import List, Optional
 import shutil
+import faiss
 
 from llama_index.core import (
     VectorStoreIndex, 
@@ -12,6 +13,7 @@ from llama_index.core import (
 from llama_index.core.llms import ChatMessage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.faiss import FaissVectorStore
 
 from src.processor.pdf_processor import PDFProcessor
 from src.llm.openai_integration import OPENAI_AVAILABLE
@@ -59,17 +61,72 @@ class RAGSystem:
                 print("Successfully loaded existing index!")
                 return True
             except Exception as e:
-                print(f"Error loading existing index: {e}")
+                print(f"Error loading existing index: {str(e)}")
+                return False
         return False
+    
+    def _process_and_index_pdfs(self, force_reload: bool = False) -> bool:
+        """Process and index PDFs"""
+        try:
+            # Check for new PDFs to process
+            if force_reload:
+                pdf_files = [f for f in os.listdir(self.pdf_dir) if f.lower().endswith('.pdf')]
+            else:
+                pdf_files = self.pdf_processor.get_unprocessed_pdfs()
+                
+            if not pdf_files:
+                print("No new PDF files to process.")
+                return False
+            
+            # Load PDFs
+            documents = self.pdf_processor.load_pdfs(force_reload=force_reload)
+            
+            if not documents:
+                print("No documents loaded.")
+                return False
+            
+            # Split the documents into chunks
+            nodes = self.pdf_processor.split_documents(documents)
+            
+            if not nodes:
+                print("No nodes created.")
+                return False
+            
+            # Create the vector store from scratch
+            print("Creating FAISS vector store...")
+            try:
+                # Get the dimension from the embedding model
+                embed_dim = 384  # Dimension for all-MiniLM-L6-v2 is 384
+                
+                # Create a FAISS index
+                faiss_index = faiss.IndexFlatL2(embed_dim)
+                
+                # Create the vector store with the FAISS index
+                vector_store = FaissVectorStore(faiss_index=faiss_index)
+                
+                if self.index is None:
+                    # Create new index with FAISS vector store
+                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                    self.index = VectorStoreIndex(nodes, storage_context=storage_context)
+                else:
+                    # Add new documents to existing index
+                    for node in nodes:
+                        self.index.insert(node)
+                
+                # Save the index to disk
+                self.index.storage_context.persist(persist_dir=self.persist_directory)
+                print("FAISS vector store updated and persisted successfully!")
+                return True
+            except Exception as e:
+                print(f"Error updating FAISS vector store: {e}")
+                return False
+                
+        except Exception as e:
+            print(f"Error processing PDFs: {e}")
+            return False
     
     def initialize(self, force_reload: bool = False) -> bool:
         """Initialize the RAG system by loading and indexing PDFs"""
-        # If not force_reload, try to load existing index first
-        if not force_reload and self._load_existing_index():
-            # Initialize the chat engine with the loaded index
-            self._initialize_chat_engine()
-            return True
-            
         # If force_reload, remove the existing vector store directory
         if force_reload and os.path.exists(self.persist_directory):
             try:
@@ -79,82 +136,23 @@ class RAGSystem:
             except Exception as e:
                 print(f"Error removing existing vector store: {e}")
         
-        # Check if there are PDFs to process
-        try:
-            if force_reload:
-                pdf_files = [f for f in os.listdir(self.pdf_dir) if f.lower().endswith('.pdf')]
-            else:
-                pdf_files = self.pdf_processor.get_unprocessed_pdfs()
-                
-            if not pdf_files and not force_reload:
-                print("No new PDF files to process.")
-                print("Checking for existing index...")
-                if self._load_existing_index():
-                    self._initialize_chat_engine()
-                    return True
-                else:
-                    print("No existing index found. Please add PDFs to process.")
-                    return False
-                
-        except FileNotFoundError as e:
-            print(str(e))
-            return False
+        # First try to load existing index
+        index_loaded = False if force_reload else self._load_existing_index()
         
-        # Load PDFs if needed
-        documents = self.pdf_processor.load_pdfs(force_reload=force_reload)
+        # Always check for new PDFs to process
+        pdfs_processed = self._process_and_index_pdfs(force_reload=force_reload)
         
-        if not documents:
-            print("No documents loaded. Please add PDFs to the data directory.")
-            return False
+        # If we couldn't load an index and didn't process any PDFs, try one more time to load
+        if not index_loaded and not pdfs_processed and not force_reload:
+            index_loaded = self._load_existing_index()
         
-        # Split the documents into chunks
-        nodes = self.pdf_processor.split_documents(documents)
-        
-        if not nodes:
-            print("No nodes created.")
-            return False
-        
-        # Create the vector store from scratch
-        print("Creating vector store...")
-        try:
-            # Create a simple index with just the documents
-            self.index = VectorStoreIndex.from_documents(nodes)
-            
-            # Save the index to disk
-            self.index.storage_context.persist(persist_dir=self.persist_directory)
-            print("Vector store created and persisted successfully!")
-            
-            # Initialize the chat engine
+        # If we have an index (either loaded or newly created), initialize the chat engine
+        if self.index:
             self._initialize_chat_engine()
             return True
-            
-        except Exception as e:
-            print(f"Error creating vector store: {e}")
-            print("Trying alternative approach...")
-            
-            try:
-                # Try a different approach if the first one fails
-                storage_context = StorageContext.from_defaults()
-                self.index = VectorStoreIndex([], storage_context=storage_context)
-                
-                # Add documents one by one
-                for doc in documents:
-                    try:
-                        self.index.insert(doc)
-                    except Exception as doc_error:
-                        print(f"Error adding document: {doc_error}")
-                
-                # Save the index to disk
-                storage_context.persist(persist_dir=self.persist_directory)
-                print("Vector store created using alternative approach!")
-                
-                # Initialize the chat engine
-                self._initialize_chat_engine()
-                return True
-                
-            except Exception as alt_error:
-                print(f"Alternative approach also failed: {alt_error}")
-                return False
+        else:
+            print("No existing index found and no PDFs to process. Please add PDFs to the data directory.")
+            return False
     
     def _initialize_chat_engine(self):
         """Initialize the chat engine for conversational retrieval"""
